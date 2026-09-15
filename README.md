@@ -73,7 +73,7 @@ Ce modèle découple totalement l'émetteur et le récepteur : ni l'ESP32 ni l'a
 Le projet utilise **HiveMQ Cloud** (cluster Serverless) comme broker, avec une connexion chiffrée TLS sur le port **8883** (MQTT over TLS) :
 
 ```cpp
-const char* mqtt_server = "xxxxxxxx.s1.eu.hivemq.cloud";
+const char* mqtt_server = "c0371e0a8d954b50986fc0f064dbe77e.s1.eu.hivemq.cloud";
 const int   mqtt_port   = 8883;
 ```
 
