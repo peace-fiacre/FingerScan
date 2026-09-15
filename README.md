@@ -1,220 +1,164 @@
-# Système de présence par empreinte digitale
 
-Architecture ESP32, R503, application mobile MIT App Inventor
+Pendant toute la durée de l'enrôlement, `mqttClient.loop()` est appelé régulièrement dans les boucles d'attente (`while` sur `getImage()`) pour que l'ESP32 reste capable de recevoir une annulation même en plein milieu d'une capture.
 
-## 1. Objectif du projet
+### 4.6 Autres flux
 
-Concevoir un système de présence biométrique permettant à des étudiants de pointer leur présence en cours en posant simplement leur doigt sur un lecteur d'empreintes digitales. La gestion et le pilotage du lecteur biométrique sont assurés par une application mobile développée avec MIT App Inventor, communiquant directement avec le module ESP32, sans serveur web complet.
+- **Consultation d'état** : l'app publie sur `esp32/cmd/status_request` (payload vide) ; l'ESP32 répond immédiatement sur `esp32/status` avec un texte formaté (état du capteur, nombre d'empreintes).
+- **Suppression ciblée** : l'app publie l'ID à supprimer sur `esp32/cmd/delete` ; l'ESP32 vérifie que l'ID existe (sinon "ID non enregistré"), supprime le gabarit (`deleteModel`) et l'entrée NVS correspondante, publie le résultat.
+- **Suppression totale** : l'app publie (payload indifférent) sur `esp32/cmd/delete_all` ; l'ESP32 vide la base du capteur (`emptyDatabase`) et toutes les entrées NVS, remet `lastId` à 0.
+- **Présence passive** : en dehors de toute commande explicite, l'ESP32 tourne en continu en mode reconnaissance (`checkPresence`) : dès qu'un doigt connu est posé, il identifie l'utilisateur et publie directement `PRESENCE_OK:nom:ID` sur `esp32/result`, sans action requise depuis l'application.
 
-## 2. Composants du projet
+### 4.7 Reconnexion et robustesse
 
-- un lecteur d'empreintes digitales R503, chargé de la capture et de la reconnaissance des empreintes
-- un microcontrôleur ESP32, programmé en Arduino C++, qui pilote le R503 et sert de point de communication avec l'application mobile
-- une liaison série UART entre l'ESP32 et le R503
-- une application mobile développée avec MIT App Inventor, permettant de commander le lecteur (enregistrement, suppression, suppression totale, consultation d'état)
-- une communication entre l'application mobile et l'ESP32 via le réseau Wi-Fi local
-- un écran OLED
+La fonction `reconnectMQTT()` est appelée en boucle tant que le client n'est pas connecté au broker. Elle génère un identifiant client aléatoire, s'authentifie, puis **réabonne systématiquement aux 5 topics de commande** — un abonnement MQTT ne survit pas à une déconnexion, il doit être refait à chaque reconnexion. Une fois reconnecté, l'ESP32 republie immédiatement son état courant, pour que l'application affiche des informations à jour sans avoir à les redemander.
 
-Le modèle exact de l'écran OLED, son interface (I2C ou SPI) et sa bibliothèque d'affichage ne sont pas précisés dans le document de conception initial. Un modèle I2C type SSD1306 128x64 est le choix le plus courant avec un ESP32, mais reste à confirmer.
+### 4.8 Côté application (MIT App Inventor)
 
-## 3. Architecture générale
+L'application utilise l'extension **UrsAI2PahoMqtt**, configurée avec l'adresse du broker HiveMQ, le port **8883**, le protocole **SSL**, ainsi que les identifiants MQTT (UserName / UserPassword). Les anciens blocs `Web1` (requêtes HTTP) ont été entièrement remplacés par :
+- des blocs **Publish** pour envoyer une commande sur un topic `esp32/cmd/...`
+- la réception d'événements **MessageReceived**, déclenchée à chaque message reçu sur les topics `esp32/status` et `esp32/result`, qui met à jour les labels d'état et de résultat correspondants
 
-```
-        Smartphone Android
-     (Application App Inventor)
-                |  Wi-Fi (HTTP)
-                v
-            ESP32   ------->   Écran OLED
-                |  UART
-                v
-              R503
-```
+## 5. Matériel nécessaire
 
-| Composant | Rôle principal |
-|---|---|
-| R503 | Capture l'image de l'empreinte, la convertit en gabarit, effectue la reconnaissance en interne, retourne l'ID à l'ESP32 |
-| ESP32 | Pilote le R503 via UART, reçoit les commandes de l'application mobile, retourne les résultats |
-| Application MIT App Inventor | Interface mobile pour déclencher les opérations : enregistrement, suppression, suppression totale, consultation d'état |
-| Écran OLED | Affiche les messages de succès, d'erreur, et le mode courant du lecteur |
-
-Le smartphone ne communique jamais directement avec le R503. L'ESP32 est le seul composant qui parle aux trois autres, il fait office de passerelle centrale.
-
-## 4. Matériel nécessaire
-
-- ESP32 (n'importe quel modèle avec Wi-Fi et au moins un port UART matériel disponible en plus du port de programmation)
-- Lecteur d'empreintes R503
-- Écran OLED (modèle à définir)
+- ESP32 — modèle utilisé : **XIAO ESP32-S3** (Wi-Fi + UART matériel disponible en plus du port de programmation)
+- Lecteur d'empreintes R503 (piloté via le module JM-101B)
+- Écran OLED SSD1306 128x64 (I2C)
+- Boîtier imprimé en 3D
+- Batterie interne (alimentation autonome, sans dépendance à une prise secteur)
 - Câbles de connexion, alimentation
 
-## 5. Câblage
+## 6. Câblage
 
-### 5.1 ESP32 vers R503 (UART)
+### 6.1 ESP32 vers R503 (UART)
 
-| R503 | ESP32 |
+| R503 (JM-101B) | ESP32 |
 |---|---|
 | VCC | 3,3V |
 | GND | GND |
-| TX | RX (UART matériel, par exemple GPIO16 pour Serial2) |
-| RX | TX (UART matériel, par exemple GPIO17 pour Serial2) |
+| TX | RX matériel (GPIO2 dans le firmware actuel) |
+| RX | TX matériel (GPIO3 dans le firmware actuel) |
 | WAKEUP (optionnel) | GPIO libre |
 | 3,3V-T (alimentation anneau tactile) | selon module |
 
-Le R503 possède un connecteur à 6 broches. Les couleurs de fils varient selon le fournisseur, il faut vérifier la correspondance exacte sur la datasheet de l'exemplaire utilisé.
+Le firmware utilise un port UART matériel dédié (`HardwareSerial mySerial(1)`) plutôt qu'une émulation logicielle, pour une communication plus fiable.
 
 Le R503 fonctionne en 3,3V. Certaines sources en ligne peu fiables évoquent une alimentation en 5V, mais la documentation officielle et les tutoriels sérieux confirment tous 3,3V. Ne pas alimenter en 5V sans avoir vérifié la datasheet précise du module utilisé.
 
-Utiliser un port UART matériel de l'ESP32 (Serial2 par exemple) plutôt qu'une émulation logicielle, pour une communication plus fiable.
-
 Le connecteur WAKEUP permet de détecter la présence d'un doigt sans interroger le capteur en continu. Il peut être laissé non connecté si cette optimisation n'est pas nécessaire.
 
-### 5.2 ESP32 vers écran OLED
+### 6.2 ESP32 vers écran OLED
 
-Non précisé dans le document de conception. Si un OLED I2C est retenu, le câblage type est : VCC vers 3,3V, GND vers GND, SDA et SCL vers deux GPIO dédiées à l'I2C de l'ESP32. À confirmer selon le modèle d'écran choisi.
+Écran confirmé : **SSD1306 I2C**, câblé comme suit :
 
-## 6. Programmation du R503
+| OLED | ESP32 |
+|---|---|
+| VCC | 3,3V |
+| GND | GND |
+| SDA | GPIO dédié (D4 dans le firmware actuel) |
+| SCL | GPIO dédié (D5 dans le firmware actuel) |
 
-- Installer la bibliothèque Adafruit_Fingerprint (compatible R503) dans l'Arduino IDE, ou une bibliothèque dédiée ESP32 si un accès plus bas niveau aux commandes est souhaité
+## 7. Programmation du R503
+
+- Installer la bibliothèque Adafruit_Fingerprint (compatible R503) dans l'Arduino IDE
 - Initialiser le port série matériel :
 ```cpp
-Serial2.begin(57600, SERIAL_8N1, PIN_RX, PIN_TX);
+mySerial.begin(57600, SERIAL_8N1, JM101B_RX_PIN, JM101B_TX_PIN);
 ```
 - Créer l'objet fingerprint sur ce port et appeler `verifyPassword()` au démarrage pour confirmer que la communication fonctionne
-- Fonctions principales du R503 à utiliser : capture d'image, conversion en caractéristiques (character file), recherche (search), stockage d'un gabarit, suppression d'un gabarit, effacement total de la base interne
+- Fonctions principales du R503 utilisées : capture d'image (`getImage`), conversion en caractéristiques (`image2Tz`), recherche rapide (`fingerFastSearch`), fusion et création de modèle (`createModel`), stockage (`storeModel`), suppression (`deleteModel`), effacement total (`emptyDatabase`)
 - Le fingerprint ID correspond à l'emplacement mémoire interne du R503, c'est un simple entier propre au module
-- Le score de confiance est une valeur retournée lors d'une recherche, indiquant le degré de similarité entre l'empreinte capturée et le gabarit trouvé
 - Ne pas présenter comme un fait établi que le format de gabarit du R503 est conforme à la norme ISO/IEC 19794-2, ce format dépend du protocole propriétaire et du firmware du module
-- Tester isolément un enrôlement puis une recherche avant toute intégration dans le firmware complet
 
-## 7. Architecture logicielle du firmware ESP32
+## 8. Architecture logicielle du firmware ESP32
 
-Le firmware peut être structuré en modules distincts :
+Le firmware est structuré en modules distincts :
 
-- module de connectivité : établissement de la connexion Wi-Fi en mode client
+- module de connectivité Wi-Fi : établissement de la connexion en mode client (DHCP)
+- module client MQTT : connexion sécurisée (TLS) au broker HiveMQ Cloud, abonnement aux topics de commande, callback unique de traitement des messages reçus (`mqttCallback`), reconnexion automatique (`reconnectMQTT`)
 - module de communication R503 : envoi des commandes UART et interprétation des réponses du lecteur
-- module d'écoute des commandes : réception des instructions de l'application mobile via un serveur HTTP embarqué
-- gestion des modes : bascule entre veille, recherche, enregistrement, suppression
-- traitement des commandes : interprétation des requêtes reçues (ENROLL, DELETE, DELETE_ALL, STATUS) et appel des fonctions correspondantes
-- gestion des erreurs : détection des échecs de communication, retour d'un message exploitable par l'application et l'écran OLED
+- module de persistance (NVS) : sauvegarde et lecture des noms associés à chaque ID d'empreinte (`Preferences`), pour afficher un nom lisible plutôt qu'un simple numéro
+- gestion des modes : bascule entre veille, recherche, enregistrement (avec confirmation en attente), suppression
+- traitement des commandes : interprétation des messages reçus sur les topics `esp32/cmd/...` et appel des fonctions correspondantes
+- gestion des erreurs : détection des échecs (capteur non détecté, doublon, timeout de capture), retour d'un message exploitable via `esp32/result` et l'écran OLED
 
-Le format exact des trames UART entre l'ESP32 et le R503 (jeu d'instructions, structure des trames) dépend de la bibliothèque retenue et n'est pas détaillé dans le document de conception initial.
+## 9. Logique métier détaillée
 
-## 8. Logique métier détaillée
+### 9.1 Enregistrement d'une empreinte
 
-### 8.1 Enregistrement d'une empreinte
+1. L'utilisateur saisit un nom dans l'application et appuie sur Enregistrer
+2. L'application publie ce nom sur `esp32/cmd/enroll_start`
+3. L'ESP32 vérifie qu'aucun enrôlement n'est déjà en attente et que le capteur est disponible, retient le nom, affiche "Confirmer sur App ?" sur l'écran OLED et publie `WAITING_CONFIRMATION`
+4. L'utilisateur confirme ; l'application publie "continue" sur `esp32/cmd/enroll_confirm`
+5. L'ESP32 calcule le nouvel ID (dernier ID connu + 1), lance la procédure de double capture requise par le R503, vérifie l'absence de doublon avant de créer le gabarit
+6. Le gabarit est stocké sur le R503, et le nom associé est sauvegardé en mémoire NVS
+7. L'ESP32 publie le résultat final sur `esp32/result` et l'affiche sur l'écran OLED
+8. L'annulation reste possible à tout moment via "cancel" sur `esp32/cmd/enroll_confirm`
 
-1. L'utilisateur appuie sur le bouton Enregistrer dans l'application
-2. L'ESP32 récupère le dernier ID utilisé
-3. L'ESP32 calcule le nouvel ID à attribuer (dernier ID + 1)
-4. L'ESP32 lance une commande d'enrollment sur le R503, avec le nouvel ID
-5. L'étudiant pose son doigt sur le capteur, en suivant la procédure de double capture requise par le R503
-6. Le R503 génère un gabarit et le stocke à l'emplacement correspondant à l'ID
-7. Le R503 retourne un code de résultat à l'ESP32
-8. L'ESP32 transmet le résultat à l'application et à l'écran OLED
+### 9.2 Suppression d'une empreinte précise
 
-Exemple :
-```
-Dernier ID connu : 24
-Nouvel ID calculé : 25
-ESP32 -> R503 : commande d'enrollment sur l'emplacement 25
-R503 -> ESP32 : succès
-ESP32 -> Application : OK, enregistrement fait à l'emplacement 25
-ESP32 -> Écran OLED : Enregistrement fait à l'emplacement 25
-```
+1. L'utilisateur saisit l'ID à supprimer et appuie sur Supprimer
+2. L'application publie cet ID sur `esp32/cmd/delete`
+3. L'ESP32 vérifie que l'ID existe (sinon message d'erreur "ID non enregistré")
+4. Le gabarit est supprimé du R503, et l'entrée NVS correspondante est effacée
+5. L'ESP32 publie une confirmation précisant le nom concerné, affichée sur l'application et l'écran OLED
 
-### 8.2 Suppression d'une empreinte précise
-
-1. L'utilisateur saisit l'ID de l'empreinte à supprimer dans l'application
-2. L'utilisateur appuie sur Supprimer
-3. L'application envoie une commande de suppression ciblée à l'ESP32 (par exemple DELETE:25)
-4. L'ESP32 transmet la commande au R503, qui efface le gabarit correspondant
-5. L'application et l'écran OLED affichent une confirmation, en précisant l'ID
-
-### 8.3 Suppression totale
+### 9.3 Suppression totale
 
 1. L'utilisateur appuie sur Effacer toute la mémoire
 2. L'application affiche un message de confirmation explicite avant d'envoyer la commande, en raison du caractère irréversible de l'opération
-3. Après confirmation, l'application envoie la commande DELETE_ALL
-4. L'ESP32 transmet la commande au R503, qui efface l'intégralité des gabarits
+3. Après confirmation, l'application publie sur `esp32/cmd/delete_all`
+4. L'ESP32 efface l'intégralité des gabarits sur le R503 ainsi que toutes les entrées NVS, et remet le dernier ID à zéro
 5. L'application et l'écran OLED confirment la réinitialisation complète
 
-La commande de suppression totale doit impérativement être protégée par une confirmation explicite côté application, pour éviter toute suppression accidentelle.
+### 9.4 Consultation de l'état du lecteur et présence passive
 
-### 8.4 Consultation de l'état du lecteur
+- L'application peut publier sur `esp32/cmd/status_request` pour connaître : la disponibilité du lecteur (connecté et opérationnel, ou en erreur), le nombre d'empreintes actuellement enregistrées
+- En dehors de toute commande explicite, l'ESP32 fonctionne aussi en **mode présence passif** : dès qu'un doigt reconnu est posé sur le capteur, il identifie l'utilisateur et publie directement le résultat (`PRESENCE_OK:nom:ID` ou `PRESENCE_REFUSED:Inconnu`) sur `esp32/result`, sans action requise depuis l'application
 
-L'application peut interroger l'ESP32 pour connaître :
-- la disponibilité du lecteur (connecté et opérationnel, ou en erreur)
-- le nombre d'empreintes actuellement enregistrées
-- le dernier résultat d'opération
+## 10. Application MIT App Inventor
 
-Exemple d'échange en mode Wi-Fi / HTTP :
-```
-GET /status HTTP/1.1
-Host: 192.168.1.50
-
-Réponse :
-{
-  "lecteur": "pret",
-  "empreintes_enregistrees": 12
-}
-```
-
-## 9. Application MIT App Inventor
-
-### 9.1 Interface (Designer)
+### 10.1 Interface (Designer)
 
 - un écran principal (Screen1)
-- boutons : Enregistrer, Supprimer, Supprimer tout, Vérifier l'état
-- un champ de saisie pour l'ID concerné par une suppression (l'enregistrement n'exige pas de saisie manuelle, l'ID est calculé automatiquement côté ESP32)
-- un composant Web (non visible), pour l'envoi des requêtes HTTP vers l'ESP32
-- une zone d'affichage des résultats et messages de confirmation ou d'erreur
-- un composant Notifier, pour la boîte de confirmation avant suppression totale
+- boutons regroupés : Enregistrer, Supprimer, Supprimer tout, Vérifier l'état
+- un champ de saisie pour le nom (enrôlement) et un champ pour l'ID (suppression ciblée)
+- deux labels séparés : un pour l'état du lecteur (status), un pour le résultat des opérations (result)
+- une horloge (Clock) de rafraîchissement automatique
+- le composant MQTT (extension **UrsAI2PahoMqtt**, non visible), configuré avec Broker, Port 8883, Protocol SSL, UserName, UserPassword
+- un composant Notifier, pour la confirmation avant suppression totale et avant confirmation d'enrôlement
 
-### 9.2 Logique par blocs
+### 10.2 Logique par blocs
 
-Bouton Enregistrer :
-```
-QUAND Bouton_Enregistrer.Click
-FAIRE
-   mettre à jour Web1.Url avec l'URL de commande d'enregistrement
-   appeler Web1.Get
-```
+- Au démarrage : `Connect` du composant MQTT, puis `Subscribe` aux topics `esp32/status` et `esp32/result`
+- Bouton Enregistrer : `Publish` sur `esp32/cmd/enroll_start` avec le nom saisi
+- Réception `MessageReceived` : routage selon le contenu du message — `WAITING_CONFIRMATION` déclenche l'ouverture du Notifier de confirmation, qui publie ensuite "continue" ou "cancel" sur `esp32/cmd/enroll_confirm` ; les autres messages (`OK`, `ERROR`, `PRESENCE_...`) mettent à jour le label de résultat
+- Réception sur `esp32/status` : mise à jour du label d'état
+- Bouton Supprimer : `Publish` de l'ID saisi sur `esp32/cmd/delete`
+- Bouton Supprimer tout : ouverture du Notifier de confirmation, puis `Publish` sur `esp32/cmd/delete_all` si confirmé
+- Bouton Vérifier l'état : `Publish` (payload vide) sur `esp32/cmd/status_request`
 
-Réception de la réponse :
-```
-QUAND Web1.GotText (réponse)
-FAIRE
-   SI réponse contient "OK" ALORS
-      afficher le message de succès avec l'ID reçu
-   SINON
-      afficher un message d'échec
-```
+### 10.3 Sécurité et robustesse de la connexion
 
-Bouton Supprimer : récupérer l'ID saisi dans le champ de texte, l'inclure dans l'URL, appeler Web1.Get.
+- Plus besoin d'IP fixe côté ESP32, ni de réseau Wi-Fi partagé entre l'application et l'ESP32 : les deux se connectent indépendamment à Internet, au même broker
+- Connexion chiffrée obligatoire : port **8883** en TLS/TCP, propriété Protocol du composant réglée sur **SSL** (le port 8884, en WebSocket, ne fonctionne pas dans cette configuration)
+- En cas de coupure réseau d'un côté ou de l'autre, chacun doit relancer sa connexion au broker indépendamment (reconnexion gérée par le composant MQTT côté application, et par `reconnectMQTT()` côté firmware)
 
-Bouton Supprimer tout : ouvrir Notifier1.ShowChooseDialog pour demander confirmation, n'envoyer la commande DELETE_ALL que si l'utilisateur confirme.
-
-Bouton Vérifier l'état : requête GET vers /status, afficher le contenu JSON reçu.
-
-### 9.3 Point de vigilance réseau
-
-L'adresse IP de l'ESP32 en Wi-Fi doit rester stable pour que l'application puisse toujours le joindre. Il est recommandé de fixer une IP statique côté ESP32, ou de faire une réservation DHCP sur le routeur, sinon l'adresse peut changer après un redémarrage du réseau.
-
-Le composant Web fonctionne bien avec des requêtes GET simples. Si des données plus complexes doivent être envoyées à l'avenir (par exemple un JSON en POST), utiliser Web1.PostText plutôt que Web1.Get.
-
-## 10. Tests et intégration
+## 11. Tests et intégration
 
 1. Tester le R503 seul (enrôlement, recherche) avant toute intégration réseau
-2. Tester le serveur HTTP de l'ESP32 seul, avec un navigateur ou un outil comme curl, avant de brancher l'application
+2. Tester la connexion MQTT de l'ESP32 seul, en vérifiant sur le dashboard HiveMQ qu'il apparaît connecté et abonné aux bons topics, avant de brancher l'application
 3. Tester l'écran OLED seul (affichage statique) avant de le relier à la logique métier
-4. Tester l'application MIT App Inventor bouton par bouton
-5. Assembler l'ensemble et tester le scénario complet : enregistrement, consultation, suppression
+4. Tester l'application MIT App Inventor bouton par bouton, en vérifiant sur le dashboard HiveMQ que les deux clients (ESP32 et application) apparaissent connectés simultanément
+5. Assembler l'ensemble et tester le scénario complet : enregistrement avec nom, consultation d'état, suppression ciblée, suppression totale, mode présence passif
 
-## 11. Limites et évolutions
+Statut : l'ensemble de ces tests, de bout en bout, a été validé avec succès.
+
+## 12. Limites et évolutions
 
 - capacité limitée du lecteur : le R503 ne peut stocker qu'un nombre restreint de gabarits, ce qui borne le nombre d'étudiants gérables
-- absence de persistance centralisée : sans base de données ni serveur, l'historique des présences n'est pas conservé, seules les opérations de gestion du lecteur sont couvertes
-- dépendance à la proximité ou au réseau local : le mode Wi-Fi nécessite que le smartphone et l'ESP32 partagent le même réseau
+- absence de persistance centralisée des présences : sans base de données ni serveur, l'historique des présences n'est pas conservé, seul l'état courant (via NVS) et les opérations de gestion du lecteur sont couverts
+- dépendance à un service tiers : le broker MQTT (HiveMQ Cloud) doit rester disponible, et les deux parties (ESP32 et application) doivent disposer d'un accès Internet fonctionnel — MQTT supprime la contrainte de réseau local partagé, mais introduit une dépendance à un service cloud externe
 - dépendance au format et au protocole propriétaire du R503
 - inadaptation à une gestion multi-salles ou à grande échelle sans évolution de l'architecture
 
-Évolution proposée : faire cohabiter cette application mobile de pilotage local avec un serveur central (par exemple une API REST) qui recevrait également les événements de présence, afin de centraliser les données de plusieurs salles ou lecteurs. L'application MIT App Inventor pourrait alors être conservée comme outil de gestion rapide et local, en complément d'une solution serveur plus complète.
+Évolution proposée : faire cohabiter cette application mobile de pilotage local avec un serveur central (par exemple une API REST, ou un client MQTT côté serveur abonné aux mêmes topics) qui recevrait également les événements de présence, afin de centraliser les données de plusieurs salles ou lecteurs. L'application MIT App Inventor pourrait alors être conservée comme outil de gestion rapide et local, en complément d'une solution serveur plus complète.
