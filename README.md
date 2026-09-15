@@ -1,3 +1,126 @@
+````markdown
+# Système de présence par empreinte digitale
+
+Architecture ESP32, R503 (JM-101B), MQTT (HiveMQ Cloud), application mobile MIT App Inventor
+
+## 1. Objectif du projet
+
+Concevoir un système de présence biométrique permettant à des étudiants de pointer leur présence en cours en posant simplement leur doigt sur un lecteur d'empreintes digitales. La gestion et le pilotage du lecteur biométrique sont assurés par une application mobile développée avec MIT App Inventor, communiquant avec le module ESP32 via un broker MQTT distant (HiveMQ Cloud), sans dépendre d'un réseau Wi-Fi local partagé entre les deux appareils.
+
+Le montage est intégralement autonome sur le plan physique : un boîtier imprimé en 3D protège l'électronique, et une batterie interne permet de l'alimenter sans câblage secteur, ce qui le rend transportable et déployable dans n'importe quelle salle.
+
+## 2. Composants du projet
+
+- un lecteur d'empreintes digitales R503 (piloté via le module JM-101B), chargé de la capture et de la reconnaissance des empreintes
+- un microcontrôleur ESP32 (modèle XIAO ESP32-S3), programmé en Arduino C++, qui pilote le R503 et sert de point de communication avec l'application mobile
+- une liaison série UART entre l'ESP32 et le R503
+- une application mobile développée avec MIT App Inventor (extension **UrsAI2PahoMqtt**), permettant de commander le lecteur (enregistrement, suppression, suppression totale, consultation d'état)
+- un broker MQTT distant (HiveMQ Cloud) assurant la communication entre l'application mobile et l'ESP32, sans connexion directe ni réseau local partagé
+- un écran OLED SSD1306 128x64 (I2C)
+- un boîtier imprimé en 3D et une batterie interne, rendant le montage physiquement autonome et transportable
+
+## 3. Architecture générale
+
+```
+        Smartphone Android
+   (App Inventor + UrsAI2PahoMqtt)
+                |
+                |  MQTT / TLS (via Internet)
+                v
+        Broker HiveMQ Cloud
+                |
+                |  MQTT / TLS (via Internet)
+                v
+            ESP32   ------->   Écran OLED
+                |  UART
+                v
+          R503 (JM-101B)
+```
+
+| Composant | Rôle principal |
+|---|---|
+| R503 (JM-101B) | Capture l'image de l'empreinte, la convertit en gabarit, effectue la reconnaissance en interne, retourne l'ID à l'ESP32 |
+| ESP32 | Pilote le R503 via UART, se connecte au broker MQTT, reçoit les commandes de l'application via les topics MQTT, publie les résultats |
+| Broker MQTT (HiveMQ Cloud) | Relaie les messages entre l'application et l'ESP32, qui ne sont jamais connectés directement ni sur le même réseau |
+| Application MIT App Inventor | Interface mobile pour déclencher les opérations : enregistrement, suppression, suppression totale, consultation d'état, via publications/souscriptions MQTT |
+| Écran OLED | Affiche les messages de succès, d'erreur, et le mode courant du lecteur |
+
+Le smartphone ne communique jamais directement ni avec le R503, ni même directement avec l'ESP32. Tout transite par le broker MQTT, qui fait office d'intermédiaire central. L'ESP32 reste le seul composant à parler directement au R503 et à l'écran OLED.
+
+## 4. Protocole MQTT et mise en œuvre
+
+### 4.1 Pourquoi migrer de HTTP vers MQTT
+
+La conception initiale reposait sur un serveur HTTP embarqué sur l'ESP32, interrogé directement par l'application via son adresse IP. Cette approche imposait une contrainte réseau forte : le smartphone et l'ESP32 devaient être sur le **même réseau Wi-Fi**. Deux cas de figure se présentaient alors, tous deux problématiques :
+
+- connecter le téléphone directement au point d'accès Wi-Fi de l'ESP32 (mode point d'accès) : cela coupe l'accès à Internet du téléphone pendant toute l'utilisation, et ne permet qu'un seul appareil connecté à la fois ;
+- connecter les deux appareils sur le réseau Wi-Fi local existant (mode station) : cela suppose alors de maîtriser l'adresse IP attribuée à l'ESP32 par le routeur (IP statique ou réservation DHCP), sans quoi l'application perd le lecteur au moindre redémarrage du réseau ou changement de routeur, une contrainte peu réaliste dans une salle de classe dont le réseau n'est pas administré par l'utilisateur du projet.
+
+Le protocole **MQTT** supprime ce problème : l'ESP32 et l'application ne communiquent jamais directement entre eux, mais uniquement avec un **broker** distant (ici HiveMQ Cloud), accessible depuis n'importe quel réseau ayant accès à Internet. Aucune des deux parties n'a besoin de connaître l'adresse IP de l'autre, ce qui rend l'architecture totalement indépendante du réseau local et de sa configuration.
+
+### 4.2 Principe du protocole MQTT
+
+MQTT (Message Queuing Telemetry Transport) est un protocole de messagerie léger fonctionnant sur le modèle **publish/subscribe**, conçu pour les objets connectés à ressources limitées :
+
+- un client **publie** un message sur un **topic** (une chaîne hiérarchique, ex. `esp32/status`)
+- un client **s'abonne** (subscribe) à un ou plusieurs topics pour recevoir tous les messages publiés dessus
+- le broker route les messages sans en connaître le contenu ni la structure
+
+Ce modèle découple totalement l'émetteur et le récepteur : ni l'ESP32 ni l'application n'ont besoin de connaître l'adresse de l'autre, seule l'adresse du broker doit être connue des deux côtés.
+
+### 4.3 Broker utilisé
+
+Le projet utilise **HiveMQ Cloud** (cluster Serverless) comme broker, avec une connexion chiffrée TLS sur le port **8883** (MQTT over TLS) :
+
+```cpp
+const char* mqtt_server = "xxxxxxxx.s1.eu.hivemq.cloud";
+const int   mqtt_port   = 8883;
+```
+
+L'authentification se fait par identifiant/mot de passe MQTT (`mqtt_user` / `mqtt_pass`). Le client `WiFiClientSecure` est utilisé avec `setInsecure()`, ce qui désactive la vérification du certificat du broker, acceptable dans un contexte pédagogique, mais à éviter en production (il faudrait charger le certificat racine de HiveMQ).
+
+Le port **8884** (WebSocket) a été testé puis écarté : il ne convient pas à une connexion MQTT native (ni côté firmware, ni côté composant App Inventor), seul le port 8883 en TLS/TCP fonctionne correctement.
+
+### 4.4 Topics utilisés
+
+| Topic | Sens | Rôle |
+|---|---|---|
+| `esp32/cmd/status_request` | App → ESP32 | Demande l'état courant du lecteur |
+| `esp32/cmd/enroll_start` | App → ESP32 | Démarre une demande d'enrôlement (payload = nom de l'utilisateur) |
+| `esp32/cmd/enroll_confirm` | App → ESP32 | Confirme ("continue") ou annule ("cancel") un enrôlement en attente |
+| `esp32/cmd/delete` | App → ESP32 | Demande la suppression d'un ID (payload = ID) |
+| `esp32/cmd/delete_all` | App → ESP32 | Demande l'effacement complet de la base |
+| `esp32/status` | ESP32 → App | Publie l'état du capteur et le nombre d'empreintes |
+| `esp32/result` | ESP32 → App | Publie le résultat de chaque opération (succès, erreur, étape en cours) |
+
+L'ESP32 s'abonne aux 5 topics de commande dans `reconnectMQTT()`, et traite chaque message reçu dans une fonction de callback unique, `mqttCallback(topic, payload, length)`, qui aiguille le traitement selon le nom du topic reçu.
+
+### 4.5 Flux complet, exemple de l'enrôlement
+
+C'est le flux le plus élaboré du firmware, car il nécessite une confirmation explicite de l'utilisateur avant de lancer la capture (pour éviter un enrôlement accidentel) :
+
+```
+1. App  → publie sur esp32/cmd/enroll_start, payload = "Jean Dupont"
+2. ESP32 (mqttCallback) :
+   - vérifie qu'aucun enrôlement n'est déjà en attente (enrollPending)
+   - vérifie que le capteur est connecté
+   - stocke le nom en attente (pendingUserName), passe enrollPending = true
+   - affiche "Confirmer sur App ?" sur l'écran OLED
+   - publie sur esp32/result : "WAITING_CONFIRMATION: Jean Dupont"
+3. App → publie sur esp32/cmd/enroll_confirm, payload = "continue"
+4. ESP32 : appelle runEnrollmentProcess()
+   - calcule le nouvel ID (dernier ID connu + 1)
+   - publie "ENROLLMENT_STARTED:Jean Dupont"
+   - attend une première capture d'image (getImage / image2Tz)
+   - vérifie qu'aucune empreinte identique n'existe déjà (fingerFastSearch)
+   - demande le retrait puis la repose du même doigt (double capture)
+   - fusionne les deux images (createModel) et stocke le gabarit (storeModel)
+   - publie le résultat final : "OK: Jean Dupont (ID 25) enregistre !"
+   - sauvegarde le nom associé à l'ID en mémoire NVS (Preferences)
+5. Annulation possible à tout moment : App publie "cancel" sur
+   esp32/cmd/enroll_confirm → cancelRequested = true, la boucle
+   d'attente de capture est interrompue proprement
+```
 
 Pendant toute la durée de l'enrôlement, `mqttClient.loop()` est appelé régulièrement dans les boucles d'attente (`while` sur `getImage()`) pour que l'ESP32 reste capable de recevoir une annulation même en plein milieu d'une capture.
 
@@ -10,7 +133,7 @@ Pendant toute la durée de l'enrôlement, `mqttClient.loop()` est appelé régul
 
 ### 4.7 Reconnexion et robustesse
 
-La fonction `reconnectMQTT()` est appelée en boucle tant que le client n'est pas connecté au broker. Elle génère un identifiant client aléatoire, s'authentifie, puis **réabonne systématiquement aux 5 topics de commande** — un abonnement MQTT ne survit pas à une déconnexion, il doit être refait à chaque reconnexion. Une fois reconnecté, l'ESP32 republie immédiatement son état courant, pour que l'application affiche des informations à jour sans avoir à les redemander.
+La fonction `reconnectMQTT()` est appelée en boucle tant que le client n'est pas connecté au broker. Elle génère un identifiant client aléatoire, s'authentifie, puis **réabonne systématiquement aux 5 topics de commande**, un abonnement MQTT ne survit pas à une déconnexion, il doit être refait à chaque reconnexion. Une fois reconnecté, l'ESP32 republie immédiatement son état courant, pour que l'application affiche des informations à jour sans avoir à les redemander.
 
 ### 4.8 Côté application (MIT App Inventor)
 
@@ -20,7 +143,7 @@ L'application utilise l'extension **UrsAI2PahoMqtt**, configurée avec l'adresse
 
 ## 5. Matériel nécessaire
 
-- ESP32 — modèle utilisé : **XIAO ESP32-S3** (Wi-Fi + UART matériel disponible en plus du port de programmation)
+- ESP32, modèle utilisé : **XIAO ESP32-S3** (Wi-Fi + UART matériel disponible en plus du port de programmation)
 - Lecteur d'empreintes R503 (piloté via le module JM-101B)
 - Écran OLED SSD1306 128x64 (I2C)
 - Boîtier imprimé en 3D
@@ -131,7 +254,7 @@ Le firmware est structuré en modules distincts :
 
 - Au démarrage : `Connect` du composant MQTT, puis `Subscribe` aux topics `esp32/status` et `esp32/result`
 - Bouton Enregistrer : `Publish` sur `esp32/cmd/enroll_start` avec le nom saisi
-- Réception `MessageReceived` : routage selon le contenu du message — `WAITING_CONFIRMATION` déclenche l'ouverture du Notifier de confirmation, qui publie ensuite "continue" ou "cancel" sur `esp32/cmd/enroll_confirm` ; les autres messages (`OK`, `ERROR`, `PRESENCE_...`) mettent à jour le label de résultat
+- Réception `MessageReceived` : routage selon le contenu du message, `WAITING_CONFIRMATION` déclenche l'ouverture du Notifier de confirmation, qui publie ensuite "continue" ou "cancel" sur `esp32/cmd/enroll_confirm` ; les autres messages (`OK`, `ERROR`, `PRESENCE_...`) mettent à jour le label de résultat
 - Réception sur `esp32/status` : mise à jour du label d'état
 - Bouton Supprimer : `Publish` de l'ID saisi sur `esp32/cmd/delete`
 - Bouton Supprimer tout : ouverture du Notifier de confirmation, puis `Publish` sur `esp32/cmd/delete_all` si confirmé
@@ -157,8 +280,11 @@ Statut : l'ensemble de ces tests, de bout en bout, a été validé avec succès.
 
 - capacité limitée du lecteur : le R503 ne peut stocker qu'un nombre restreint de gabarits, ce qui borne le nombre d'étudiants gérables
 - absence de persistance centralisée des présences : sans base de données ni serveur, l'historique des présences n'est pas conservé, seul l'état courant (via NVS) et les opérations de gestion du lecteur sont couverts
-- dépendance à un service tiers : le broker MQTT (HiveMQ Cloud) doit rester disponible, et les deux parties (ESP32 et application) doivent disposer d'un accès Internet fonctionnel — MQTT supprime la contrainte de réseau local partagé, mais introduit une dépendance à un service cloud externe
+- dépendance à un service tiers : le broker MQTT (HiveMQ Cloud) doit rester disponible, et les deux parties (ESP32 et application) doivent disposer d'un accès Internet fonctionnel, MQTT supprime la contrainte de réseau local partagé, mais introduit une dépendance à un service cloud externe
 - dépendance au format et au protocole propriétaire du R503
 - inadaptation à une gestion multi-salles ou à grande échelle sans évolution de l'architecture
 
 Évolution proposée : faire cohabiter cette application mobile de pilotage local avec un serveur central (par exemple une API REST, ou un client MQTT côté serveur abonné aux mêmes topics) qui recevrait également les événements de présence, afin de centraliser les données de plusieurs salles ou lecteurs. L'application MIT App Inventor pourrait alors être conservée comme outil de gestion rapide et local, en complément d'une solution serveur plus complète.
+````
+
+Dis-moi si tu veux que je crée le fichier `README.md` avec ce contenu.
