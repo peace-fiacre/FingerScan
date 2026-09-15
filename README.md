@@ -287,4 +287,4 @@ Statut : l'ensemble de ces tests, de bout en bout, a été validé avec succès.
 Évolution proposée : faire cohabiter cette application mobile de pilotage local avec un serveur central (par exemple une API REST, ou un client MQTT côté serveur abonné aux mêmes topics) qui recevrait également les événements de présence, afin de centraliser les données de plusieurs salles ou lecteurs. L'application MIT App Inventor pourrait alors être conservée comme outil de gestion rapide et local, en complément d'une solution serveur plus complète.
 ````
 
-Dis-moi si tu veux que je crée le fichier `README.md` avec ce contenu.
+
